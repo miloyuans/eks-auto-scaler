@@ -9,7 +9,6 @@ import (
 	"log"
 	"math"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -138,9 +137,9 @@ func main() {
 // ==================== 获取 Region (IMDS v2) ====================
 func getRegionFromIMDS(ctx context.Context) string {
 	client := imds.New(imds.Options{})
-	path := "latest/dynamic/instance-identity/document"
+	path := "latest/dynamic/instance-identity/document" // string
 	resp, err := client.GetMetadata(ctx, &imds.GetMetadataInput{
-		Path: &path, // 修复：&path (string) → *string
+		Path: &path, // string → *string 正确！
 	})
 	if err != nil {
 		log.Printf("IMDS 获取失败，使用默认: %v", err)
@@ -148,7 +147,7 @@ func getRegionFromIMDS(ctx context.Context) string {
 	}
 	defer resp.Content.Close()
 
-	body, err := io.ReadAll(resp.Content) // 修复：导入 io
+	body, err := io.ReadAll(resp.Content)
 	if err != nil {
 		log.Printf("读取 IMDS 失败: %v", err)
 		return "us-east-1"
@@ -254,7 +253,7 @@ func (s *Scaler) checkNodeGroup(ctx context.Context, cluster string, ng ekstypes
 		return fmt.Errorf("无 ASG")
 	}
 	asgName := *ng.Resources.AutoScalingGroups[0].Name
-	instances, err := s.getInstancesFromASG(ctx, asgName) // 修复：通过 ASG 获取实例
+	instances, err := s.getInstancesFromASG(ctx, asgName)
 	if err != nil {
 		return err
 	}
