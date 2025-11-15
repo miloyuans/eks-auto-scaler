@@ -137,9 +137,8 @@ func main() {
 // ==================== 获取 Region (IMDS v2) ====================
 func getRegionFromIMDS(ctx context.Context) string {
 	client := imds.New(imds.Options{})
-	path := "latest/dynamic/instance-identity/document" // string
 	resp, err := client.GetMetadata(ctx, &imds.GetMetadataInput{
-		Path: &path, // string → *string 正确！
+		Path: aws.String("latest/dynamic/instance-identity/document"),
 	})
 	if err != nil {
 		log.Printf("IMDS 获取失败，使用默认: %v", err)
