@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"os"
@@ -130,18 +131,16 @@ func main() {
 	}
 	globalScaler = scaler
 
-	// 启动异步监控
 	go scaler.startMonitoring(ctx)
-
-	// 保持运行
 	select {}
 }
 
 // ==================== 获取 Region (IMDS v2) ====================
 func getRegionFromIMDS(ctx context.Context) string {
 	client := imds.New(imds.Options{})
+	path := "latest/dynamic/instance-identity/document"
 	resp, err := client.GetMetadata(ctx, &imds.GetMetadataInput{
-		Path: aws.String("latest/dynamic/instance-identity/document"),
+		Path: &path, // 修复：&path (string) → *string
 	})
 	if err != nil {
 		log.Printf("IMDS 获取失败，使用默认: %v", err)
@@ -149,7 +148,12 @@ func getRegionFromIMDS(ctx context.Context) string {
 	}
 	defer resp.Content.Close()
 
-	body, _ := io.ReadAll(resp.Content)
+	body, err := io.ReadAll(resp.Content) // 修复：导入 io
+	if err != nil {
+		log.Printf("读取 IMDS 失败: %v", err)
+		return "us-east-1"
+	}
+
 	var doc struct {
 		Region string `json:"region"`
 	}
@@ -250,7 +254,7 @@ func (s *Scaler) checkNodeGroup(ctx context.Context, cluster string, ng ekstypes
 		return fmt.Errorf("无 ASG")
 	}
 	asgName := *ng.Resources.AutoScalingGroups[0].Name
-	instances, err := s.getNodeInstances(ctx, cluster, ng)
+	instances, err := s.getInstancesFromASG(ctx, asgName) // 修复：通过 ASG 获取实例
 	if err != nil {
 		return err
 	}
@@ -278,6 +282,24 @@ func (s *Scaler) checkNodeGroup(ctx context.Context, cluster string, ng ekstypes
 		go s.triggerScaleUp(ctx, cluster, *ng.NodegroupName, asgName, triggerInst, triggerPct)
 	}
 	return nil
+}
+
+// ==================== 从 ASG 获取实例 ID ====================
+func (s *Scaler) getInstancesFromASG(ctx context.Context, asgName string) ([]string, error) {
+	resp, err := s.asgClient.DescribeAutoScalingGroups(ctx, &autoscaling.DescribeAutoScalingGroupsInput{
+		AutoScalingGroupNames: []string{asgName},
+	})
+	if err != nil || len(resp.AutoScalingGroups) == 0 {
+		return nil, fmt.Errorf("ASG %s 不存在或无实例", asgName)
+	}
+
+	var instances []string
+	for _, inst := range resp.AutoScalingGroups[0].Instances {
+		if inst.InstanceId != nil {
+			instances = append(instances, *inst.InstanceId)
+		}
+	}
+	return instances, nil
 }
 
 // ==================== 扩容（串行） ====================
@@ -331,27 +353,6 @@ func (s *Scaler) triggerScaleUp(ctx context.Context, cluster, ngName, asgName, i
 	)
 	log.Println(successMsg)
 	s.notifier.Send(successMsg)
-}
-
-// ==================== 获取节点实例 ====================
-func (s *Scaler) getNodeInstances(ctx context.Context, cluster string, ng ekstypes.Nodegroup) ([]string, error) {
-	var insts []string
-	p := eks.NewListPodsPaginator(s.eksClient, &eks.ListPodsInput{
-		ClusterName:   &cluster,
-		NodegroupName: ng.NodegroupName,
-	})
-	for p.HasMorePages() {
-		page, err := p.NextPage(ctx)
-		if err != nil {
-			return nil, err
-		}
-		for _, pod := range page.Pods {
-			if strings.HasPrefix(*pod, "i-") && len(*pod) >= 19 {
-				insts = append(insts, (*pod)[:19])
-			}
-		}
-	}
-	return insts, nil
 }
 
 // ==================== 获取内存使用率 ====================
