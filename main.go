@@ -137,18 +137,22 @@ func main() {
 // ==================== 获取 Region (IMDS v2) ====================
 func getRegionFromIMDS(ctx context.Context) string {
 	client := imds.New(imds.Options{})
-	resp, err := client.GetMetadata(ctx, &imds.GetMetadataInput{
+
+	// 关键：先构造 input 变量
+	input := &imds.GetMetadataInput{
 		Path: aws.String("latest/dynamic/instance-identity/document"),
-	})
+	}
+
+	resp, err := client.GetMetadata(ctx, input)
 	if err != nil {
-		log.Printf("IMDS 获取失败，使用默认: %v", err)
+		log.Printf("IMDS 获取失败，使用默认 region: %v", err)
 		return "us-east-1"
 	}
 	defer resp.Content.Close()
 
 	body, err := io.ReadAll(resp.Content)
 	if err != nil {
-		log.Printf("读取 IMDS 失败: %v", err)
+		log.Printf("读取 IMDS 响应失败: %v", err)
 		return "us-east-1"
 	}
 
@@ -156,9 +160,10 @@ func getRegionFromIMDS(ctx context.Context) string {
 		Region string `json:"region"`
 	}
 	if err := json.Unmarshal(body, &doc); err != nil || doc.Region == "" {
-		log.Printf("解析 Region 失败: %v", err)
+		log.Printf("解析 IMDS document 失败: %v", err)
 		return "us-east-1"
 	}
+
 	return doc.Region
 }
 
