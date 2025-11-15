@@ -1,25 +1,28 @@
-# config.yaml
+# config.yaml - 详细说明
+
 monitor:
-  interval_seconds: 300          # 每5分钟探测一次
-  metric_threshold_percent: 90.0 # 内存阈值
-  scale_up_by: 1                 # 扩容数量
+  interval_seconds: 300          # 探测间隔，单位秒（推荐 300 = 5分钟）
+  metric_threshold_percent: 90.0 # 内存使用率 ≥ 90% 触发扩容
+  scale_up_by: 1                 # 每次扩容增加的节点数
 
 telegram:
-  enabled: true
-  bot_token: "YOUR_TELEGRAM_BOT_TOKEN"
-  chat_id: -1001234567890        # 群组或用户 ID
+  enabled: true                  # 是否启用 Telegram 通知
+  bot_token: "123456:ABC-..."    # Telegram Bot Token（从 @BotFather 获取）
+  chat_id: -1001234567890        # 群组或用户 ID（群组为负数）
 
-cooldown_minutes: 10             # 冷却时间
+cooldown_minutes: 10             # 扩容后冷却时间，防止频繁扩容
 
-# ========== 多集群配置 ==========
+# ========== 多集群、多 NodeGroup 配置 ==========
 clusters:
-  - name: "prod-eks-cluster"
-    region: "ap-east-1"
+  # 集群1
+  - name: "prod-eks-cluster"     # EKS 集群名称（必须存在）
+    region: "ap-east-1"          # AWS 区域
     nodegroups:
-      - name: "workers-ng-1"
-        fallback: ["workers-ng-2"]
-      - name: "workers-ng-2"
+      - name: "workers-ng-1"     # 主 NodeGroup
+        fallback: ["workers-ng-2"] # 失败时尝试的备用组（按顺序）
+      - name: "workers-ng-2"     # 备用组（可选）
 
+  # 集群2
   - name: "staging-eks-cluster"
     region: "ap-southeast-1"
     nodegroups:

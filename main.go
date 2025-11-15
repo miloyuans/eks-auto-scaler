@@ -7,6 +7,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"strings" // 已添加
 	"sync"
 	"time"
 
@@ -17,7 +18,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	cloudwatchtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/aws/aws-sdk-go-v2/service/eks"
-	ekstypes "github.com/aws/aws-sdk-go-v2/service/eks/types"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"gopkg.in/yaml.v3"
 )
@@ -29,9 +29,9 @@ type NodeGroupConfig struct {
 }
 
 type ClusterConfig struct {
-	Name       string             `yaml:"name"`
-	Region     string             `yaml:"region"`
-	NodeGroups []NodeGroupConfig  `yaml:"nodegroups"`
+	Name       string            `yaml:"name"`
+	Region     string            `yaml:"region"`
+	NodeGroups []NodeGroupConfig `yaml:"nodegroups"`
 }
 
 type Config struct {
@@ -45,7 +45,7 @@ type Config struct {
 		BotToken string `yaml:"bot_token"`
 		ChatID   int64 `yaml:"chat_id"`
 	} `yaml:"telegram"`
-	CooldownMinutes int `yaml:"cooldown_minutes"`
+	CooldownMinutes int              `yaml:"cooldown_minutes"`
 	Clusters        []ClusterConfig `yaml:"clusters"`
 }
 
