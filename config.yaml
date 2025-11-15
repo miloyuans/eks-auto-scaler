@@ -1,12 +1,12 @@
 # config.yaml
 monitor:
-  interval_seconds: 300   # 每5分钟探测一次
-  metric_threshold_percent: 90.0
-  scale_up_by: 1
+  interval_seconds: 300          # 每5分钟探测一次
+  metric_threshold_percent: 90.0 # 内存阈值
+  scale_up_by: 1                 # 扩容数量
 
 telegram:
   enabled: true
-  bot_token: "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
-  chat_id: -1001234567890   # 群组或用户 ID
+  bot_token: "YOUR_TELEGRAM_BOT_TOKEN"
+  chat_id: -1001234567890        # 群组或用户 ID
 
-cooldown_minutes: 10
+cooldown_minutes: 10             # 冷却时间

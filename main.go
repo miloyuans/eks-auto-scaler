@@ -3,9 +3,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"math"
 	"os"
@@ -14,7 +12,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 	"github.com/aws/aws-sdk-go-v2/service/autoscaling"
 	"github.com/aws/aws-sdk-go-v2/service/autoscaling/types"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
@@ -25,7 +22,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// ==================== 配置 ====================
+// ==================== 配置结构 ====================
 type Config struct {
 	Monitor struct {
 		IntervalSeconds        int     `yaml:"interval_seconds"`
@@ -94,10 +91,11 @@ type Scaler struct {
 
 var globalScaler *Scaler
 
+// ==================== 主函数 ====================
 func main() {
 	ctx := context.Background()
 
-	// 加载配置
+	// 1. 加载 config.yaml
 	data, err := os.ReadFile("config.yaml")
 	if err != nil {
 		log.Fatalf("读取 config.yaml 失败: %v", err)
@@ -107,19 +105,20 @@ func main() {
 		log.Fatalf("解析 config.yaml 失败: %v", err)
 	}
 
-	// AWS 配置 + 自动 Region
+	// 2. 加载 AWS 配置 + 获取 Region
 	awsCfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
 		log.Fatalf("加载 AWS 配置失败: %v", err)
 	}
-	awsCfg.Region = getRegionFromIMDS(ctx)
+	awsCfg.Region = getRegion(ctx)
 
-	// 初始化 Notifier
+	// 3. 初始化 Telegram
 	notifier, err := NewNotifier(cfg.Telegram.BotToken, cfg.Telegram.ChatID, cfg.Telegram.Enabled)
 	if err != nil {
 		log.Fatalf("初始化 Telegram 失败: %v", err)
 	}
 
+	// 4. 初始化 Scaler
 	scaler := &Scaler{
 		cfg:         cfg,
 		eksClient:   eks.NewFromConfig(awsCfg),
@@ -130,41 +129,34 @@ func main() {
 	}
 	globalScaler = scaler
 
+	// 5. 启动异步监控
 	go scaler.startMonitoring(ctx)
+
+	// 6. 保持运行
 	select {}
 }
 
-// ==================== 获取 Region (IMDS v2) ====================
-func getRegionFromIMDS(ctx context.Context) string {
-	client := imds.New(imds.Options{})
-
-	// 关键：先构造 input 变量
-	input := &imds.GetMetadataInput{
-		Path: aws.String("latest/dynamic/instance-identity/document"),
+// ==================== 获取 Region（稳定方案）================
+func getRegion(ctx context.Context) string {
+	// 1. 从 AWS Config 获取（优先）
+	if cfg, err := config.LoadDefaultConfig(ctx); err == nil && cfg.Region != "" {
+		log.Printf("从 AWS Config 获取 Region: %s", cfg.Region)
+		return cfg.Region
 	}
 
-	resp, err := client.GetMetadata(ctx, input)
-	if err != nil {
-		log.Printf("IMDS 获取失败，使用默认 region: %v", err)
-		return "us-east-1"
+	// 2. 从环境变量
+	if region := os.Getenv("AWS_REGION"); region != "" {
+		log.Printf("从 AWS_REGION 环境变量获取: %s", region)
+		return region
 	}
-	defer resp.Content.Close()
-
-	body, err := io.ReadAll(resp.Content)
-	if err != nil {
-		log.Printf("读取 IMDS 响应失败: %v", err)
-		return "us-east-1"
+	if region := os.Getenv("AWS_DEFAULT_REGION"); region != "" {
+		log.Printf("从 AWS_DEFAULT_REGION 环境变量获取: %s", region)
+		return region
 	}
 
-	var doc struct {
-		Region string `json:"region"`
-	}
-	if err := json.Unmarshal(body, &doc); err != nil || doc.Region == "" {
-		log.Printf("解析 IMDS document 失败: %v", err)
-		return "us-east-1"
-	}
-
-	return doc.Region
+	// 3. 默认
+	log.Printf("未设置 Region，使用默认: us-east-1")
+	return "us-east-1"
 }
 
 // ==================== 监控主循环 ====================
@@ -173,12 +165,13 @@ func (s *Scaler) startMonitoring(ctx context.Context) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	log.Printf("监控启动: 间隔 %ds | 阈值 %.1f%% | 扩容 +%d", s.cfg.Monitor.IntervalSeconds, s.cfg.Monitor.MetricThresholdPercent, s.cfg.Monitor.ScaleUpBy)
-	s.notifier.Send(fmt.Sprintf("*EKS 自动扩容已启动*\n间隔: %ds | 阈值: %.1f%% | 扩容: +%d", s.cfg.Monitor.IntervalSeconds, s.cfg.Monitor.MetricThresholdPercent, s.cfg.Monitor.ScaleUpBy))
+	log.Printf("EKS 自动扩容监控已启动")
+	log.Printf("配置: 间隔=%ds, 阈值=%.1f%%, 扩容+%d", s.cfg.Monitor.IntervalSeconds, s.cfg.Monitor.MetricThresholdPercent, s.cfg.Monitor.ScaleUpBy)
+	s.notifier.Send(fmt.Sprintf("*EKS 自动扩容监控已启动*\n间隔: %ds | 阈值: %.1f%% | 扩容: +%d", s.cfg.Monitor.IntervalSeconds, s.cfg.Monitor.MetricThresholdPercent, s.cfg.Monitor.ScaleUpBy))
 
 	for {
 		s.currentTime = time.Now().UTC()
-		log.Printf("=== 探测开始 [%s] ===", s.currentTime.Format("2006-01-02 15:04:05 UTC"))
+		log.Printf("=== 开始探测 [%s] ===", s.currentTime.Format("2006-01-02 15:04:05 UTC"))
 
 		if err := s.runOnce(ctx); err != nil {
 			log.Printf("监控周期失败: %v", err)
@@ -254,7 +247,7 @@ func (s *Scaler) listNodegroups(ctx context.Context, cluster string) ([]ekstypes
 // ==================== 节点检查 ====================
 func (s *Scaler) checkNodeGroup(ctx context.Context, cluster string, ng ekstypes.Nodegroup) error {
 	if ng.Resources == nil || len(ng.Resources.AutoScalingGroups) == 0 {
-		return fmt.Errorf("无 ASG")
+		return fmt.Errorf("NodeGroup %s 无 ASG", *ng.NodegroupName)
 	}
 	asgName := *ng.Resources.AutoScalingGroups[0].Name
 	instances, err := s.getInstancesFromASG(ctx, asgName)
@@ -269,10 +262,10 @@ func (s *Scaler) checkNodeGroup(ctx context.Context, cluster string, ng ekstypes
 	for _, inst := range instances {
 		pct, err := s.getMemoryUsage(ctx, inst)
 		if err != nil {
-			log.Printf("  [Node %s] 获取失败: %v", inst, err)
+			log.Printf("  [Node %s] 获取内存失败: %v", inst, err)
 			continue
 		}
-		log.Printf("  [Node %s] 内存平均: %.1f%%", inst, pct)
+		log.Printf("  [Node %s] 内存平均使用率: %.1f%%", inst, pct)
 
 		if pct >= s.cfg.Monitor.MetricThresholdPercent && !high {
 			high = true
@@ -305,25 +298,27 @@ func (s *Scaler) getInstancesFromASG(ctx context.Context, asgName string) ([]str
 	return instances, nil
 }
 
-// ==================== 扩容（串行） ====================
+// ==================== 扩容（串行锁） ====================
 func (s *Scaler) triggerScaleUp(ctx context.Context, cluster, ngName, asgName, inst string, pct float64) {
 	s.scalingLock.Lock()
 	defer s.scalingLock.Unlock()
 
-	log.Printf("高负载触发: %s (%.1f%%) → 扩容 %s (ASG: %s)", inst, pct, ngName, asgName)
+	log.Printf("检测到高负载: %s (%.1f%%) → 触发扩容 NodeGroup %s (ASG: %s)", inst, pct, ngName, asgName)
 
+	// 冷却检查
 	if s.isInCooldown(ctx, asgName) {
-		msg := fmt.Sprintf("ASG %s 冷却中，跳过扩容", asgName)
+		msg := fmt.Sprintf("ASG %s 处于冷却期，跳过扩容", asgName)
 		log.Println(msg)
 		s.notifier.Send(msg)
 		return
 	}
 
+	// 获取当前 Desired
 	desc, err := s.asgClient.DescribeAutoScalingGroups(ctx, &autoscaling.DescribeAutoScalingGroupsInput{
 		AutoScalingGroupNames: []string{asgName},
 	})
 	if err != nil || len(desc.AutoScalingGroups) == 0 {
-		s.notifier.Send(fmt.Sprintf("获取 ASG 失败: %v", err))
+		s.notifier.Send(fmt.Sprintf("获取 ASG %s 失败: %v", asgName, err))
 		return
 	}
 	current := *desc.AutoScalingGroups[0].DesiredCapacity
@@ -342,8 +337,10 @@ func (s *Scaler) triggerScaleUp(ctx context.Context, cluster, ngName, asgName, i
 		return
 	}
 
+	// 添加冷却标签
 	s.addCooldownTag(ctx, asgName)
 
+	// 成功通知
 	successMsg := fmt.Sprintf(
 		"*EKS 自动扩容成功*\n"+
 			"集群: `%s`\n"+
@@ -389,7 +386,7 @@ func (s *Scaler) getMemoryUsage(ctx context.Context, inst string) (float64, erro
 	return math.Round(max*10) / 10, nil
 }
 
-// ==================== 冷却与标签 ====================
+// ==================== 冷却机制 ====================
 func (s *Scaler) isInCooldown(ctx context.Context, asg string) bool {
 	out, err := s.asgClient.DescribeTags(ctx, &autoscaling.DescribeTagsInput{
 		Filters: []types.Filter{
