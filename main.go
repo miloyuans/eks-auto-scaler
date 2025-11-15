@@ -3,10 +3,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +22,8 @@ import (
 	cloudwatchtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/aws/aws-sdk-go-v2/service/eks"
 	ekstypes "github.com/aws/aws-sdk-go-v2/service/eks/types"
+	"github.com/aws/aws-sdk-go-v2/service/ec2" // 用于解析 IID
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"gopkg.in/yaml.v3"
 )
 
@@ -47,6 +52,45 @@ type Scaler struct {
 	region        string
 }
 
+type Notifier struct {
+	bot     *tgbotapi.BotAPI
+	chatID  int64
+	enabled bool
+}
+
+func NewNotifier(token string, chatID int64, enabled bool) (*Notifier, error) {
+	if !enabled {
+		return &Notifier{enabled: false}, nil
+	}
+	bot, err := tgbotapi.NewBotAPI(token)
+	if err != nil {
+		return nil, err
+	}
+	return &Notifier{bot: bot, chatID: chatID, enabled: true}, nil
+}
+
+func (n *Notifier) Send(msg string) {
+	if !n.enabled {
+		log.Printf("[Telegram Disabled] %s", truncate(msg, 100))
+		return
+	}
+	message := tgbotapi.NewMessage(n.chatID, msg)
+	message.ParseMode = "HTML"
+	_, err := n.bot.Send(message)
+	if err != nil {
+		log.Printf("Telegram 发送失败: %v", err)
+	} else {
+		log.Printf("Telegram 已通知: %s", truncate(msg, 100))
+	}
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
+
 var globalScaler *Scaler
 
 func main() {
@@ -68,15 +112,8 @@ func main() {
 		log.Fatalf("加载 AWS 配置失败: %v", err)
 	}
 
-	// 自动获取 Region
-	imdsClient := imds.New(imds.Options{})
-	info, _ := imdsClient.GetInstanceInfo(ctx, &imds.GetInstanceInfoInput{})
-	if info != nil && info.InstanceInfo.Region != nil {
-		awsCfg.Region = *info.InstanceInfo.Region
-	}
-	if awsCfg.Region == "" {
-		awsCfg.Region = "us-east-1"
-	}
+	// 自动获取 Region（使用 IMDS）
+	awsCfg.Region = getRegion(ctx)
 
 	// 初始化 Notifier
 	notifier, err := NewNotifier(cfg.Telegram.BotToken, cfg.Telegram.ChatID, cfg.Telegram.Enabled)
@@ -99,6 +136,26 @@ func main() {
 
 	// 保持运行
 	select {}
+}
+
+func getRegion(ctx context.Context) string {
+	imdsClient := imds.New(imds.Options{})
+	iid, err := imdsClient.GetMetadata(ctx, &imds.GetMetadataInput{
+		Path: aws.String("/latest/dynamic/instance-identity/document"),
+	})
+	if err != nil {
+		log.Printf("获取 IMDS 失败，使用默认 Region: %v", err)
+		return "us-east-1"
+	}
+
+	var doc struct {
+		Region string `json:"region"`
+	}
+	if err := json.Unmarshal([]byte(iid.Content), &doc); err != nil {
+		log.Printf("解析 IID 失败: %v", err)
+		return "us-east-1"
+	}
+	return doc.Region
 }
 
 func (s *Scaler) startMonitoring(ctx context.Context) {
@@ -273,8 +330,8 @@ func (s *Scaler) triggerScaleUp(ctx context.Context, cluster, ngName, asgName, i
 
 func (s *Scaler) getNodeInstances(ctx context.Context, cluster string, ng ekstypes.Nodegroup) ([]string, error) {
 	var insts []string
-	p := eks.NewListNodesPaginator(s.eksClient, &eks.ListNodesInput{
-		ClusterName:   &cluster,
+	p := eks.NewListPodsPaginator(s.eksClient, &eks.ListPodsInput{ // 修正：ListNodes 使用 ListPods
+		ClusterName: &cluster,
 		NodegroupName: ng.NodegroupName,
 	})
 	for p.HasMorePages() {
@@ -282,9 +339,9 @@ func (s *Scaler) getNodeInstances(ctx context.Context, cluster string, ng ekstyp
 		if err != nil {
 			return nil, err
 		}
-		for _, node := range page.Nodes {
-			if len(node) >= 19 && node[:2] == "i-" {
-				insts = append(insts, node[:19])
+		for _, node := range page.Pods { // 修正：Pods 字段
+			if len(*node) >= 19 && strings.HasPrefix(*node, "i-") {
+				insts = append(insts, (*node)[:19])
 			}
 		}
 	}
@@ -299,7 +356,7 @@ func (s *Scaler) getMemoryUsage(ctx context.Context, inst string) (float64, erro
 		Namespace:  aws.String("ContainerInsights"),
 		MetricName: aws.String("mem_used_percent"),
 		Dimensions: []cloudwatchtypes.Dimension{
-			{Name: aws.String("InstanceId"), Value: &inst},
+			{Name: aws.String("InstanceId"), Value: aws.String(inst)},
 		},
 		StartTime:  &start,
 		EndTime:    &end,
@@ -342,10 +399,10 @@ func (s *Scaler) isInCooldown(ctx context.Context, asg string) bool {
 
 func (s *Scaler) addCooldownTag(ctx context.Context, asg string) {
 	ts := s.currentTime.Format(time.RFC3339)
-	s.asgClient.CreateOrUpdateTags(ctx, &autoscaling.CreateOrUpdateTagsInput{
+	_, _ = s.asgClient.CreateOrUpdateTags(ctx, &autoscaling.CreateOrUpdateTagsInput{
 		Tags: []types.Tag{
 			{
-				ResourceId:        &asg,
+				ResourceId:        aws.String(asg),
 				ResourceType:      aws.String("auto-scaling-group"),
 				Key:               aws.String("eks-auto-scaled-at"),
 				Value:             &ts,
