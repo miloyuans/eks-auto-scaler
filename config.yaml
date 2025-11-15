@@ -10,3 +10,19 @@ telegram:
   chat_id: -1001234567890        # 群组或用户 ID
 
 cooldown_minutes: 10             # 冷却时间
+
+# ========== 多集群配置 ==========
+clusters:
+  - name: "prod-eks-cluster"
+    region: "ap-east-1"
+    nodegroups:
+      - name: "workers-ng-1"
+        fallback: ["workers-ng-2"]
+      - name: "workers-ng-2"
+
+  - name: "staging-eks-cluster"
+    region: "ap-southeast-1"
+    nodegroups:
+      - name: "app-ng"
+        fallback: ["gpu-ng"]
+      - name: "gpu-ng"

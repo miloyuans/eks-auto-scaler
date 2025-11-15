@@ -23,6 +23,17 @@ import (
 )
 
 // ==================== 配置结构 ====================
+type NodeGroupConfig struct {
+	Name     string   `yaml:"name"`
+	Fallback []string `yaml:"fallback"` // 失败时尝试的备用组
+}
+
+type ClusterConfig struct {
+	Name       string             `yaml:"name"`
+	Region     string             `yaml:"region"`
+	NodeGroups []NodeGroupConfig  `yaml:"nodegroups"`
+}
+
 type Config struct {
 	Monitor struct {
 		IntervalSeconds        int     `yaml:"interval_seconds"`
@@ -35,6 +46,14 @@ type Config struct {
 		ChatID   int64 `yaml:"chat_id"`
 	} `yaml:"telegram"`
 	CooldownMinutes int `yaml:"cooldown_minutes"`
+	Clusters        []ClusterConfig `yaml:"clusters"`
+}
+
+// ==================== 客户端缓存 ====================
+type Clients struct {
+	eksClient   *eks.Client
+	cwClient    *cloudwatch.Client
+	asgClient   *autoscaling.Client
 }
 
 // ==================== Telegram 通知 ====================
@@ -79,14 +98,11 @@ func truncate(s string, n int) string {
 
 // ==================== 主结构体 ====================
 type Scaler struct {
-	cfg           Config
-	eksClient     *eks.Client
-	cwClient      *cloudwatch.Client
-	asgClient     *autoscaling.Client
-	notifier      *Notifier
-	scalingLock   sync.Mutex
-	currentTime   time.Time
-	region        string
+	cfg         Config
+	notifier    *Notifier
+	clients     map[string]*Clients // region -> clients
+	scalingLock sync.Mutex
+	currentTime time.Time
 }
 
 var globalScaler *Scaler
@@ -95,7 +111,7 @@ var globalScaler *Scaler
 func main() {
 	ctx := context.Background()
 
-	// 1. 加载 config.yaml
+	// 加载配置
 	data, err := os.ReadFile("config.yaml")
 	if err != nil {
 		log.Fatalf("读取 config.yaml 失败: %v", err)
@@ -105,58 +121,39 @@ func main() {
 		log.Fatalf("解析 config.yaml 失败: %v", err)
 	}
 
-	// 2. 加载 AWS 配置 + 获取 Region
-	awsCfg, err := config.LoadDefaultConfig(ctx)
-	if err != nil {
-		log.Fatalf("加载 AWS 配置失败: %v", err)
-	}
-	awsCfg.Region = getRegion(ctx)
-
-	// 3. 初始化 Telegram
+	// 初始化 Telegram
 	notifier, err := NewNotifier(cfg.Telegram.BotToken, cfg.Telegram.ChatID, cfg.Telegram.Enabled)
 	if err != nil {
 		log.Fatalf("初始化 Telegram 失败: %v", err)
 	}
 
-	// 4. 初始化 Scaler
+	// 初始化客户端（按 Region 缓存）
+	clients := make(map[string]*Clients)
+	for _, cluster := range cfg.Clusters {
+		if _, exists := clients[cluster.Region]; exists {
+			continue
+		}
+		awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(cluster.Region))
+		if err != nil {
+			log.Printf("加载 Region %s 配置失败: %v", cluster.Region, err)
+			continue
+		}
+		clients[cluster.Region] = &Clients{
+			eksClient: eks.NewFromConfig(awsCfg),
+			cwClient:  cloudwatch.NewFromConfig(awsCfg),
+			asgClient: autoscaling.NewFromConfig(awsCfg),
+		}
+	}
+
 	scaler := &Scaler{
-		cfg:         cfg,
-		eksClient:   eks.NewFromConfig(awsCfg),
-		cwClient:    cloudwatch.NewFromConfig(awsCfg),
-		asgClient:   autoscaling.NewFromConfig(awsCfg),
-		notifier:    notifier,
-		region:      awsCfg.Region,
+		cfg:      cfg,
+		notifier: notifier,
+		clients:  clients,
 	}
 	globalScaler = scaler
 
-	// 5. 启动异步监控
 	go scaler.startMonitoring(ctx)
-
-	// 6. 保持运行
 	select {}
-}
-
-// ==================== 获取 Region（稳定方案）================
-func getRegion(ctx context.Context) string {
-	// 1. 从 AWS Config 获取（优先）
-	if cfg, err := config.LoadDefaultConfig(ctx); err == nil && cfg.Region != "" {
-		log.Printf("从 AWS Config 获取 Region: %s", cfg.Region)
-		return cfg.Region
-	}
-
-	// 2. 从环境变量
-	if region := os.Getenv("AWS_REGION"); region != "" {
-		log.Printf("从 AWS_REGION 环境变量获取: %s", region)
-		return region
-	}
-	if region := os.Getenv("AWS_DEFAULT_REGION"); region != "" {
-		log.Printf("从 AWS_DEFAULT_REGION 环境变量获取: %s", region)
-		return region
-	}
-
-	// 3. 默认
-	log.Printf("未设置 Region，使用默认: us-east-1")
-	return "us-east-1"
 }
 
 // ==================== 监控主循环 ====================
@@ -165,107 +162,78 @@ func (s *Scaler) startMonitoring(ctx context.Context) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	log.Printf("EKS 自动扩容监控已启动")
-	log.Printf("配置: 间隔=%ds, 阈值=%.1f%%, 扩容+%d", s.cfg.Monitor.IntervalSeconds, s.cfg.Monitor.MetricThresholdPercent, s.cfg.Monitor.ScaleUpBy)
-	s.notifier.Send(fmt.Sprintf("*EKS 自动扩容监控已启动*\n间隔: %ds | 阈值: %.1f%% | 扩容: +%d", s.cfg.Monitor.IntervalSeconds, s.cfg.Monitor.MetricThresholdPercent, s.cfg.Monitor.ScaleUpBy))
+	log.Printf("EKS 自动扩容监控启动，监控 %d 个集群", len(s.cfg.Clusters))
+	s.notifier.Send(fmt.Sprintf("*EKS 自动扩容已启动*\n监控 %d 个集群 | 阈值 %.1f%%", len(s.cfg.Clusters), s.cfg.Monitor.MetricThresholdPercent))
 
 	for {
 		s.currentTime = time.Now().UTC()
-		log.Printf("=== 开始探测 [%s] ===", s.currentTime.Format("2006-01-02 15:04:05 UTC"))
+		log.Printf("=== 探测开始 [%s] ===", s.currentTime.Format("2006-01-02 15:04:05 UTC"))
 
-		if err := s.runOnce(ctx); err != nil {
-			log.Printf("监控周期失败: %v", err)
-			s.notifier.Send(fmt.Sprintf("监控周期失败: %v", err))
+		for _, cluster := range s.cfg.Clusters {
+			if err := s.processCluster(ctx, cluster); err != nil {
+				log.Printf("处理集群 %s 失败: %v", cluster.Name, err)
+			}
 		}
 
 		<-ticker.C
 	}
 }
 
-func (s *Scaler) runOnce(ctx context.Context) error {
-	clusters, err := s.listEKSClusters(ctx)
-	if err != nil {
-		return err
+func (s *Scaler) processCluster(ctx context.Context, clusterCfg ClusterConfig) error {
+	clients, ok := s.clients[clusterCfg.Region]
+	if !ok {
+		return fmt.Errorf("Region %s 无客户端", clusterCfg.Region)
 	}
 
-	for _, cluster := range clusters {
-		if err := s.processCluster(ctx, cluster); err != nil {
-			log.Printf("处理集群 %s 失败: %v", cluster, err)
+	// 验证集群存在
+	desc, err := clients.eksClient.DescribeCluster(ctx, &eks.DescribeClusterInput{Name: &clusterCfg.Name})
+	if err != nil || desc.Cluster == nil {
+		log.Printf("集群 %s 不存在或无法访问: %v", clusterCfg.Name, err)
+		return nil
+	}
+
+	for _, ngCfg := range clusterCfg.NodeGroups {
+		if err := s.checkAndScaleNodeGroup(ctx, clusterCfg, ngCfg, clients); err != nil {
+			log.Printf("检查 NodeGroup %s 失败: %v", ngCfg.Name, err)
 		}
 	}
 	return nil
 }
 
-func (s *Scaler) listEKSClusters(ctx context.Context) ([]string, error) {
-	var clusters []string
-	p := eks.NewListClustersPaginator(s.eksClient, &eks.ListClustersInput{})
-	for p.HasMorePages() {
-		page, err := p.NextPage(ctx)
-		if err != nil {
-			return nil, err
-		}
-		clusters = append(clusters, page.Clusters...)
+// ==================== 检查并扩容 NodeGroup ====================
+func (s *Scaler) checkAndScaleNodeGroup(ctx context.Context, clusterCfg ClusterConfig, ngCfg NodeGroupConfig, clients *Clients) error {
+	// 获取 NodeGroup
+	ng, err := clients.eksClient.DescribeNodegroup(ctx, &eks.DescribeNodegroupInput{
+		ClusterName:   &clusterCfg.Name,
+		NodegroupName: &ngCfg.Name,
+	})
+	if err != nil || ng.Nodegroup == nil {
+		log.Printf("NodeGroup %s 不存在: %v", ngCfg.Name, err)
+		return nil
 	}
-	return clusters, nil
-}
+	if ng.Nodegroup.Resources == nil || len(ng.Nodegroup.Resources.AutoScalingGroups) == 0 {
+		return fmt.Errorf("NodeGroup %s 无 ASG", ngCfg.Name)
+	}
+	asgName := *ng.Nodegroup.Resources.AutoScalingGroups[0].Name
 
-func (s *Scaler) processCluster(ctx context.Context, cluster string) error {
-	ngs, err := s.listNodegroups(ctx, cluster)
-	if err != nil {
-		return err
-	}
-	for _, ng := range ngs {
-		if err := s.checkNodeGroup(ctx, cluster, ng); err != nil {
-			log.Printf("检查 NodeGroup %s 失败: %v", *ng.NodegroupName, err)
-		}
-	}
-	return nil
-}
-
-func (s *Scaler) listNodegroups(ctx context.Context, cluster string) ([]ekstypes.Nodegroup, error) {
-	var ngs []ekstypes.Nodegroup
-	p := eks.NewListNodegroupsPaginator(s.eksClient, &eks.ListNodegroupsInput{ClusterName: &cluster})
-	for p.HasMorePages() {
-		page, err := p.NextPage(ctx)
-		if err != nil {
-			return nil, err
-		}
-		for _, name := range page.Nodegroups {
-			desc, err := s.eksClient.DescribeNodegroup(ctx, &eks.DescribeNodegroupInput{
-				ClusterName:   &cluster,
-				NodegroupName: &name,
-			})
-			if err != nil {
-				continue
-			}
-			ngs = append(ngs, *desc.Nodegroup)
-		}
-	}
-	return ngs, nil
-}
-
-// ==================== 节点检查 ====================
-func (s *Scaler) checkNodeGroup(ctx context.Context, cluster string, ng ekstypes.Nodegroup) error {
-	if ng.Resources == nil || len(ng.Resources.AutoScalingGroups) == 0 {
-		return fmt.Errorf("NodeGroup %s 无 ASG", *ng.NodegroupName)
-	}
-	asgName := *ng.Resources.AutoScalingGroups[0].Name
-	instances, err := s.getInstancesFromASG(ctx, asgName)
+	// 获取实例
+	instances, err := s.getInstancesFromASG(ctx, clients.asgClient, asgName)
 	if err != nil {
 		return err
 	}
 
+	// 检查内存
+	high := false
 	var triggerInst string
 	var triggerPct float64
-	high := false
 
 	for _, inst := range instances {
-		pct, err := s.getMemoryUsage(ctx, inst)
+		pct, err := s.getMemoryUsage(ctx, clients.cwClient, inst)
 		if err != nil {
 			log.Printf("  [Node %s] 获取内存失败: %v", inst, err)
 			continue
 		}
-		log.Printf("  [Node %s] 内存平均使用率: %.1f%%", inst, pct)
+		log.Printf("  [Cluster: %s] [NodeGroup: %s] [Node %s] 内存: %.1f%%", clusterCfg.Name, ngCfg.Name, inst, pct)
 
 		if pct >= s.cfg.Monitor.MetricThresholdPercent && !high {
 			high = true
@@ -274,21 +242,113 @@ func (s *Scaler) checkNodeGroup(ctx context.Context, cluster string, ng ekstypes
 		}
 	}
 
-	if high {
-		go s.triggerScaleUp(ctx, cluster, *ng.NodegroupName, asgName, triggerInst, triggerPct)
+	if !high {
+		return nil
 	}
+
+	// 触发扩容（带 fallback）
+	candidates := append([]string{ngCfg.Name}, ngCfg.Fallback...)
+	success := false
+	var failReasons []string
+
+	for _, name := range candidates {
+		if success {
+			break
+		}
+		log.Printf("尝试扩容 NodeGroup: %s", name)
+		if err := s.scaleUpNodeGroup(ctx, clusterCfg, name, clients, triggerInst, triggerPct); err != nil {
+			failReasons = append(failReasons, fmt.Sprintf("%s: %v", name, err))
+			log.Printf("扩容 %s 失败: %v", name, err)
+		} else {
+			success = true
+			log.Printf("扩容 %s 成功", name)
+		}
+	}
+
+	if !success {
+		errMsg := fmt.Sprintf(
+			"*EKS 扩容失败*\n"+
+				"集群: `%s`\n"+
+				"触发节点: `%s` (%.1f%%)\n"+
+				"失败原因:\n%s",
+			clusterCfg.Name, triggerInst, triggerPct, "\n- "+strings.Join(failReasons, "\n- "),
+		)
+		s.notifier.Send(errMsg)
+	}
+
 	return nil
 }
 
-// ==================== 从 ASG 获取实例 ID ====================
-func (s *Scaler) getInstancesFromASG(ctx context.Context, asgName string) ([]string, error) {
-	resp, err := s.asgClient.DescribeAutoScalingGroups(ctx, &autoscaling.DescribeAutoScalingGroupsInput{
+// ==================== 执行扩容 ====================
+func (s *Scaler) scaleUpNodeGroup(ctx context.Context, clusterCfg ClusterConfig, ngName string, clients *Clients, inst string, pct float64) error {
+	s.scalingLock.Lock()
+	defer s.scalingLock.Unlock()
+
+	// 获取 NodeGroup ASG
+	ng, err := clients.eksClient.DescribeNodegroup(ctx, &eks.DescribeNodegroupInput{
+		ClusterName:   &clusterCfg.Name,
+		NodegroupName: &ngName,
+	})
+	if err != nil || ng.Nodegroup == nil {
+		return fmt.Errorf("NodeGroup %s 不存在", ngName)
+	}
+	if ng.Nodegroup.Resources == nil || len(ng.Nodegroup.Resources.AutoScalingGroups) == 0 {
+		return fmt.Errorf("NodeGroup %s 无 ASG", ngName)
+	}
+	asgName := *ng.Nodegroup.Resources.AutoScalingGroups[0].Name
+
+	// 冷却检查
+	if s.isInCooldown(ctx, clients.asgClient, asgName) {
+		return fmt.Errorf("ASG %s 冷却中", asgName)
+	}
+
+	// 获取当前 Desired
+	desc, err := clients.asgClient.DescribeAutoScalingGroups(ctx, &autoscaling.DescribeAutoScalingGroupsInput{
+		AutoScalingGroupNames: []string{asgName},
+	})
+	if err != nil || len(desc.AutoScalingGroups) == 0 {
+		return fmt.Errorf("获取 ASG 失败")
+	}
+	current := *desc.AutoScalingGroups[0].DesiredCapacity
+	newDesired := current + int32(s.cfg.Monitor.ScaleUpBy)
+
+	// 执行扩容
+	_, err = clients.asgClient.UpdateAutoScalingGroup(ctx, &autoscaling.UpdateAutoScalingGroupInput{
+		AutoScalingGroupName: &asgName,
+		DesiredCapacity:      &newDesired,
+	})
+	if err != nil {
+		return err
+	}
+
+	// 添加冷却标签
+	s.addCooldownTag(ctx, clients.asgClient, asgName)
+
+	// 成功通知
+	successMsg := fmt.Sprintf(
+		"*EKS 自动扩容成功*\n"+
+			"集群: `%s`\n"+
+			"NodeGroup: `%s`\n"+
+			"触发节点: `%s` (%.1f%%)\n"+
+			"ASG: `%s`\n"+
+			"Desired: `%d to %d`\n"+
+			"时间: `%s`",
+		clusterCfg.Name, ngName, inst, pct, asgName, current, newDesired, s.currentTime.Format("15:04:05 UTC"),
+	)
+	log.Println(successMsg)
+	s.notifier.Send(successMsg)
+
+	return nil
+}
+
+// ==================== 工具函数 ====================
+func (s *Scaler) getInstancesFromASG(ctx context.Context, client *autoscaling.Client, asgName string) ([]string, error) {
+	resp, err := client.DescribeAutoScalingGroups(ctx, &autoscaling.DescribeAutoScalingGroupsInput{
 		AutoScalingGroupNames: []string{asgName},
 	})
 	if err != nil || len(resp.AutoScalingGroups) == 0 {
-		return nil, fmt.Errorf("ASG %s 不存在或无实例", asgName)
+		return nil, fmt.Errorf("ASG %s 无实例", asgName)
 	}
-
 	var instances []string
 	for _, inst := range resp.AutoScalingGroups[0].Instances {
 		if inst.InstanceId != nil {
@@ -298,65 +358,7 @@ func (s *Scaler) getInstancesFromASG(ctx context.Context, asgName string) ([]str
 	return instances, nil
 }
 
-// ==================== 扩容（串行锁） ====================
-func (s *Scaler) triggerScaleUp(ctx context.Context, cluster, ngName, asgName, inst string, pct float64) {
-	s.scalingLock.Lock()
-	defer s.scalingLock.Unlock()
-
-	log.Printf("检测到高负载: %s (%.1f%%) → 触发扩容 NodeGroup %s (ASG: %s)", inst, pct, ngName, asgName)
-
-	// 冷却检查
-	if s.isInCooldown(ctx, asgName) {
-		msg := fmt.Sprintf("ASG %s 处于冷却期，跳过扩容", asgName)
-		log.Println(msg)
-		s.notifier.Send(msg)
-		return
-	}
-
-	// 获取当前 Desired
-	desc, err := s.asgClient.DescribeAutoScalingGroups(ctx, &autoscaling.DescribeAutoScalingGroupsInput{
-		AutoScalingGroupNames: []string{asgName},
-	})
-	if err != nil || len(desc.AutoScalingGroups) == 0 {
-		s.notifier.Send(fmt.Sprintf("获取 ASG %s 失败: %v", asgName, err))
-		return
-	}
-	current := *desc.AutoScalingGroups[0].DesiredCapacity
-	newDesired := current + int32(s.cfg.Monitor.ScaleUpBy)
-
-	log.Printf("执行扩容: %s Desired %d → %d", asgName, current, newDesired)
-
-	_, err = s.asgClient.UpdateAutoScalingGroup(ctx, &autoscaling.UpdateAutoScalingGroupInput{
-		AutoScalingGroupName: &asgName,
-		DesiredCapacity:      &newDesired,
-	})
-	if err != nil {
-		errMsg := fmt.Sprintf("扩容失败: %v", err)
-		log.Println(errMsg)
-		s.notifier.Send(errMsg)
-		return
-	}
-
-	// 添加冷却标签
-	s.addCooldownTag(ctx, asgName)
-
-	// 成功通知
-	successMsg := fmt.Sprintf(
-		"*EKS 自动扩容成功*\n"+
-			"集群: `%s`\n"+
-			"NodeGroup: `%s`\n"+
-			"触发节点: `%s` (%.1f%%)\n"+
-			"ASG: `%s`\n"+
-			"Desired: `%d → %d`\n"+
-			"时间: `%s`",
-		cluster, ngName, inst, pct, asgName, current, newDesired, s.currentTime.Format("15:04:05 UTC"),
-	)
-	log.Println(successMsg)
-	s.notifier.Send(successMsg)
-}
-
-// ==================== 获取内存使用率 ====================
-func (s *Scaler) getMemoryUsage(ctx context.Context, inst string) (float64, error) {
+func (s *Scaler) getMemoryUsage(ctx context.Context, client *cloudwatch.Client, inst string) (float64, error) {
 	end := s.currentTime
 	start := end.Add(-6 * time.Minute)
 
@@ -372,7 +374,7 @@ func (s *Scaler) getMemoryUsage(ctx context.Context, inst string) (float64, erro
 		Statistics: []cloudwatchtypes.Statistic{cloudwatchtypes.StatisticAverage},
 	}
 
-	out, err := s.cwClient.GetMetricStatistics(ctx, input)
+	out, err := client.GetMetricStatistics(ctx, input)
 	if err != nil || len(out.Datapoints) == 0 {
 		return 0, fmt.Errorf("无数据")
 	}
@@ -386,9 +388,8 @@ func (s *Scaler) getMemoryUsage(ctx context.Context, inst string) (float64, erro
 	return math.Round(max*10) / 10, nil
 }
 
-// ==================== 冷却机制 ====================
-func (s *Scaler) isInCooldown(ctx context.Context, asg string) bool {
-	out, err := s.asgClient.DescribeTags(ctx, &autoscaling.DescribeTagsInput{
+func (s *Scaler) isInCooldown(ctx context.Context, client *autoscaling.Client, asg string) bool {
+	out, err := client.DescribeTags(ctx, &autoscaling.DescribeTagsInput{
 		Filters: []types.Filter{
 			{Name: aws.String("auto-scaling-group"), Values: []string{asg}},
 			{Name: aws.String("key"), Values: []string{"eks-auto-scaled-at"}},
@@ -406,9 +407,9 @@ func (s *Scaler) isInCooldown(ctx context.Context, asg string) bool {
 	return false
 }
 
-func (s *Scaler) addCooldownTag(ctx context.Context, asg string) {
+func (s *Scaler) addCooldownTag(ctx context.Context, client *autoscaling.Client, asg string) {
 	ts := s.currentTime.Format(time.RFC3339)
-	_, _ = s.asgClient.CreateOrUpdateTags(ctx, &autoscaling.CreateOrUpdateTagsInput{
+	_, _ = client.CreateOrUpdateTags(ctx, &autoscaling.CreateOrUpdateTagsInput{
 		Tags: []types.Tag{
 			{
 				ResourceId:        aws.String(asg),
