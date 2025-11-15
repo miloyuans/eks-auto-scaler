@@ -24,14 +24,14 @@ import (
 
 type Config struct {
 	Monitor struct {
-		IntervalSeconds       int     `yaml:"interval_seconds"`
+		IntervalSeconds        int     `yaml:"interval_seconds"`
 		MetricThresholdPercent float64 `yaml:"metric_threshold_percent"`
-		ScaleUpBy             int     `yaml:"scale_up_by"`
+		ScaleUpBy              int     `yaml:"scale_up_by"`
 	} `yaml:"monitor"`
 	Telegram struct {
-		Enabled  bool   `yaml:"enabled"`
+		Enabled  bool  `yaml:"enabled"`
 		BotToken string `yaml:"bot_token"`
-		ChatID   int64  `yaml:"chat_id"`
+		ChatID   int64 `yaml:"chat_id"`
 	} `yaml:"telegram"`
 	CooldownMinutes int `yaml:"cooldown_minutes"`
 }
@@ -53,12 +53,12 @@ func main() {
 	ctx := context.Background()
 
 	// 加载配置
-	configData, err := os.ReadFile("config.yaml")
+	data, err := os.ReadFile("config.yaml")
 	if err != nil {
 		log.Fatalf("读取 config.yaml 失败: %v", err)
 	}
 	var cfg Config
-	if err := yaml.Unmarshal(configData, &cfg); err != nil {
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		log.Fatalf("解析 config.yaml 失败: %v", err)
 	}
 
@@ -70,9 +70,9 @@ func main() {
 
 	// 自动获取 Region
 	imdsClient := imds.New(imds.Options{})
-	inst, _ := imdsClient.GetInstanceInfo(ctx, &imds.GetInstanceInfoInput{})
-	if inst != nil && inst.InstanceInfo.Region != nil {
-		awsCfg.Region = *inst.InstanceInfo.Region
+	info, _ := imdsClient.GetInstanceInfo(ctx, &imds.GetInstanceInfoInput{})
+	if info != nil && info.InstanceInfo.Region != nil {
+		awsCfg.Region = *info.InstanceInfo.Region
 	}
 	if awsCfg.Region == "" {
 		awsCfg.Region = "us-east-1"
@@ -91,14 +91,13 @@ func main() {
 		asgClient:   autoscaling.NewFromConfig(awsCfg),
 		notifier:    notifier,
 		region:      awsCfg.Region,
-		currentTime: time.Now().UTC(),
 	}
 	globalScaler = scaler
 
-	// 启动异步监控
+	// 异步启动监控
 	go scaler.startMonitoring(ctx)
 
-	// 主线程保持运行
+	// 保持运行
 	select {}
 }
 
@@ -107,16 +106,16 @@ func (s *Scaler) startMonitoring(ctx context.Context) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	log.Printf("监控启动: 每 %d 秒探测一次，阈值 %.1f%%，扩容 +%d", s.cfg.Monitor.IntervalSeconds, s.cfg.Monitor.MetricThresholdPercent, s.cfg.Monitor.ScaleUpBy)
+	log.Printf("监控已启动: 间隔 %ds | 阈值 %.1f%% | 扩容 +%d", s.cfg.Monitor.IntervalSeconds, s.cfg.Monitor.MetricThresholdPercent, s.cfg.Monitor.ScaleUpBy)
 	s.notifier.Send(fmt.Sprintf("EKS 自动扩容监控已启动\n间隔: %ds | 阈值: %.1f%% | 扩容: +%d", s.cfg.Monitor.IntervalSeconds, s.cfg.Monitor.MetricThresholdPercent, s.cfg.Monitor.ScaleUpBy))
 
 	for {
 		s.currentTime = time.Now().UTC()
-		log.Printf("=== 开始第 %s 次监控探测 ===", s.currentTime.Format("2006-01-02 15:04:05 UTC"))
+		log.Printf("=== 开始探测 [%s] ===", s.currentTime.Format("2006-01-02 15:04:05 UTC"))
 
 		if err := s.runOnce(ctx); err != nil {
-			log.Printf("监控周期失败: %v", err)
-			s.notifier.Send(fmt.Sprintf("监控周期失败: %v", err))
+			log.Printf("监控周期异常: %v", err)
+			s.notifier.Send(fmt.Sprintf("监控周期异常: %v", err))
 		}
 
 		<-ticker.C
@@ -139,9 +138,9 @@ func (s *Scaler) runOnce(ctx context.Context) error {
 
 func (s *Scaler) listEKSClusters(ctx context.Context) ([]string, error) {
 	var clusters []string
-	paginator := eks.NewListClustersPaginator(s.eksClient, &eks.ListClustersInput{})
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
+	p := eks.NewListClustersPaginator(s.eksClient, &eks.ListClustersInput{})
+	for p.HasMorePages() {
+		page, err := p.NextPage(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -150,31 +149,30 @@ func (s *Scaler) listEKSClusters(ctx context.Context) ([]string, error) {
 	return clusters, nil
 }
 
-func (s *Scaler) processCluster(ctx context.Context, clusterName string) error {
-	nodegroups, err := s.listNodegroups(ctx, clusterName)
+func (s *Scaler) processCluster(ctx context.Context, cluster string) error {
+	ngs, err := s.listNodegroups(ctx, cluster)
 	if err != nil {
 		return err
 	}
-
-	for _, ng := range nodegroups {
-		if err := s.checkNodeGroup(ctx, clusterName, ng); err != nil {
+	for _, ng := range ngs {
+		if err := s.checkNodeGroup(ctx, cluster, ng); err != nil {
 			log.Printf("检查 NodeGroup %s 失败: %v", *ng.NodegroupName, err)
 		}
 	}
 	return nil
 }
 
-func (s *Scaler) listNodegroups(ctx context.Context, clusterName string) ([]ekstypes.Nodegroup, error) {
+func (s *Scaler) listNodegroups(ctx context.Context, cluster string) ([]ekstypes.Nodegroup, error) {
 	var ngs []ekstypes.Nodegroup
-	paginator := eks.NewListNodegroupsPaginator(s.eksClient, &eks.ListNodegroupsInput{ClusterName: &clusterName})
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
+	p := eks.NewListNodegroupsPaginator(s.eksClient, &eks.ListNodegroupsInput{ClusterName: &cluster})
+	for p.HasMorePages() {
+		page, err := p.NextPage(ctx)
 		if err != nil {
 			return nil, err
 		}
 		for _, name := range page.Nodegroups {
 			desc, err := s.eksClient.DescribeNodegroup(ctx, &eks.DescribeNodegroupInput{
-				ClusterName:   &clusterName,
+				ClusterName:   &cluster,
 				NodegroupName: &name,
 			})
 			if err != nil {
@@ -186,71 +184,65 @@ func (s *Scaler) listNodegroups(ctx context.Context, clusterName string) ([]ekst
 	return ngs, nil
 }
 
-func (s *Scaler) checkNodeGroup(ctx context.Context, clusterName string, ng ekstypes.Nodegroup) error {
+func (s *Scaler) checkNodeGroup(ctx context.Context, cluster string, ng ekstypes.Nodegroup) error {
 	if ng.Resources == nil || len(ng.Resources.AutoScalingGroups) == 0 {
 		return fmt.Errorf("无 ASG")
 	}
 	asgName := *ng.Resources.AutoScalingGroups[0].Name
-	instances, err := s.getNodeInstances(ctx, clusterName, ng)
+	instances, err := s.getNodeInstances(ctx, cluster, ng)
 	if err != nil {
 		return err
 	}
 
-	// 打印每个节点内存
-	highUsage := false
-	var highInstance string
-	var highPercent float64
+	high := false
+	var triggerInst string
+	var triggerPct float64
 
 	for _, inst := range instances {
-		usage, err := s.getMemoryUsage(ctx, inst)
+		pct, err := s.getMemoryUsage(ctx, inst)
 		if err != nil {
-			log.Printf("  [Node %s] 获取内存失败: %v", inst, err)
+			log.Printf("  [Node %s] 获取失败: %v", inst, err)
 			continue
 		}
-		log.Printf("  [Node %s] 内存平均使用率: %.1f%%", inst, usage)
+		log.Printf("  [Node %s] 内存平均: %.1f%%", inst, pct)
 
-		if usage >= s.cfg.Monitor.MetricThresholdPercent && !highUsage {
-			highUsage = true
-			highInstance = inst
-			highPercent = usage
+		if pct >= s.cfg.Monitor.MetricThresholdPercent && !high {
+			high = true
+			triggerInst = inst
+			triggerPct = pct
 		}
 	}
 
-	if !highUsage {
-		return nil
+	if high {
+		go s.triggerScaleUp(ctx, cluster, *ng.NodegroupName, asgName, triggerInst, triggerPct)
 	}
-
-	// 触发扩容（串行）
-	go s.triggerScaleUp(ctx, clusterName, *ng.NodegroupName, asgName, highInstance, highPercent, instances)
 	return nil
 }
 
-func (s *Scaler) triggerScaleUp(ctx context.Context, cluster, ngName, asgName, instanceID string, percent float64, instances []string) {
+func (s *Scaler) triggerScaleUp(ctx context.Context, cluster, ngName, asgName, inst string, pct float64) {
 	s.scalingLock.Lock()
 	defer s.scalingLock.Unlock()
 
-	log.Printf("检测到高负载节点: %s (%.1f%%) → 准备扩容 NodeGroup %s (ASG: %s)", instanceID, percent, ngName, asgName)
+	log.Printf("高负载触发: %s (%.1f%%) → 扩容 %s (ASG: %s)", inst, pct, ngName, asgName)
 
-	// 冷却检查
 	if s.isInCooldown(ctx, asgName) {
-		msg := fmt.Sprintf("ASG %s 处于冷却期，跳过扩容", asgName)
+		msg := fmt.Sprintf("ASG %s 冷却中，跳过", asgName)
 		log.Println(msg)
 		s.notifier.Send(msg)
 		return
 	}
 
-	// 获取当前 Desired
 	desc, err := s.asgClient.DescribeAutoScalingGroups(ctx, &autoscaling.DescribeAutoScalingGroupsInput{
 		AutoScalingGroupNames: []string{asgName},
 	})
 	if err != nil || len(desc.AutoScalingGroups) == 0 {
-		s.notifier.Send(fmt.Sprintf("获取 ASG %s 失败: %v", asgName, err))
+		s.notifier.Send(fmt.Sprintf("获取 ASG 失败: %v", err))
 		return
 	}
 	current := *desc.AutoScalingGroups[0].DesiredCapacity
 	newDesired := current + int32(s.cfg.Monitor.ScaleUpBy)
 
-	log.Printf("开始扩容: %s Desired %d → %d", asgName, current, newDesired)
+	log.Printf("执行扩容: %s Desired %d → %d", asgName, current, newDesired)
 
 	_, err = s.asgClient.UpdateAutoScalingGroup(ctx, &autoscaling.UpdateAutoScalingGroupInput{
 		AutoScalingGroupName: &asgName,
@@ -263,10 +255,8 @@ func (s *Scaler) triggerScaleUp(ctx context.Context, cluster, ngName, asgName, i
 		return
 	}
 
-	// 打冷却标签
 	s.addCooldownTag(ctx, asgName)
 
-	// 成功通知
 	successMsg := fmt.Sprintf(
 		"*EKS 自动扩容成功*\n"+
 			"集群: `%s`\n"+
@@ -275,33 +265,33 @@ func (s *Scaler) triggerScaleUp(ctx context.Context, cluster, ngName, asgName, i
 			"ASG: `%s`\n"+
 			"Desired: `%d → %d`\n"+
 			"时间: `%s`",
-		cluster, ngName, instanceID, percent, asgName, current, newDesired, s.currentTime.Format("15:04:05 UTC"),
+		cluster, ngName, inst, pct, asgName, current, newDesired, s.currentTime.Format("15:04:05 UTC"),
 	)
 	log.Println(successMsg)
 	s.notifier.Send(successMsg)
 }
 
-func (s *Scaler) getNodeInstances(ctx context.Context, clusterName string, ng ekstypes.Nodegroup) ([]string, error) {
-	var instances []string
-	paginator := eks.NewListNodesPaginator(s.eksClient, &eks.ListNodesInput{
-		ClusterName:   &clusterName,
+func (s *Scaler) getNodeInstances(ctx context.Context, cluster string, ng ekstypes.Nodegroup) ([]string, error) {
+	var insts []string
+	p := eks.NewListNodesPaginator(s.eksClient, &eks.ListNodesInput{
+		ClusterName:   &cluster,
 		NodegroupName: ng.NodegroupName,
 	})
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
+	for p.HasMorePages() {
+		page, err := p.NextPage(ctx)
 		if err != nil {
 			return nil, err
 		}
 		for _, node := range page.Nodes {
 			if len(node) >= 19 && node[:2] == "i-" {
-				instances = append(instances, node[:19])
+				insts = append(insts, node[:19])
 			}
 		}
 	}
-	return instances, nil
+	return insts, nil
 }
 
-func (s *Scaler) getMemoryUsage(ctx context.Context, instanceID string) (float64, error) {
+func (s *Scaler) getMemoryUsage(ctx context.Context, inst string) (float64, error) {
 	end := s.currentTime
 	start := end.Add(-6 * time.Minute)
 
@@ -309,7 +299,7 @@ func (s *Scaler) getMemoryUsage(ctx context.Context, instanceID string) (float64
 		Namespace:  aws.String("ContainerInsights"),
 		MetricName: aws.String("mem_used_percent"),
 		Dimensions: []cloudwatchtypes.Dimension{
-			{Name: aws.String("InstanceId"), Value: &instanceID},
+			{Name: aws.String("InstanceId"), Value: &inst},
 		},
 		StartTime:  &start,
 		EndTime:    &end,
@@ -317,13 +307,13 @@ func (s *Scaler) getMemoryUsage(ctx context.Context, instanceID string) (float64
 		Statistics: []cloudwatchtypes.Statistic{cloudwatchtypes.StatisticAverage},
 	}
 
-	result, err := s.cwClient.GetMetricStatistics(ctx, input)
-	if err != nil || len(result.Datapoints) == 0 {
+	out, err := s.cwClient.GetMetricStatistics(ctx, input)
+	if err != nil || len(out.Datapoints) == 0 {
 		return 0, fmt.Errorf("无数据")
 	}
 
 	var max float64
-	for _, dp := range result.Datapoints {
+	for _, dp := range out.Datapoints {
 		if dp.Average != nil && *dp.Average > max {
 			max = *dp.Average
 		}
@@ -331,34 +321,34 @@ func (s *Scaler) getMemoryUsage(ctx context.Context, instanceID string) (float64
 	return math.Round(max*10) / 10, nil
 }
 
-func (s *Scaler) isInCooldown(ctx context.Context, asgName string) bool {
-	output, err := s.asgClient.DescribeTags(ctx, &autoscaling.DescribeTagsInput{
+func (s *Scaler) isInCooldown(ctx context.Context, asg string) bool {
+	out, err := s.asgClient.DescribeTags(ctx, &autoscaling.DescribeTagsInput{
 		Filters: []types.Filter{
-			{Name: aws.String("auto-scaling-group"), Values: []string{asgName}},
+			{Name: aws.String("auto-scaling-group"), Values: []string{asg}},
 			{Name: aws.String("key"), Values: []string{"eks-auto-scaled-at"}},
 		},
 	})
-	if err != nil || len(output.Tags) == 0 {
+	if err != nil || len(out.Tags) == 0 {
 		return false
 	}
-	for _, tag := range output.Tags {
-		if *tag.Key == "eks-auto-scaled-at" {
-			t, _ := time.Parse(time.RFC3339, *tag.Value)
-			return s.currentTime.Sub(t) < time.Duration(s.cfg.CooldownMinutes)*time.Minute
+	for _, t := range out.Tags {
+		if *t.Key == "eks-auto-scaled-at" {
+			ts, _ := time.Parse(time.RFC3339, *t.Value)
+			return s.currentTime.Sub(ts) < time.Duration(s.cfg.CooldownMinutes)*time.Minute
 		}
 	}
 	return false
 }
 
-func (s *Scaler) addCooldownTag(ctx context.Context, asgName string) {
-	timestamp := s.currentTime.Format(time.RFC3339)
+func (s *Scaler) addCooldownTag(ctx context.Context, asg string) {
+	ts := s.currentTime.Format(time.RFC3339)
 	s.asgClient.CreateOrUpdateTags(ctx, &autoscaling.CreateOrUpdateTagsInput{
 		Tags: []types.Tag{
 			{
-				ResourceId:        &asgName,
+				ResourceId:        &asg,
 				ResourceType:      aws.String("auto-scaling-group"),
 				Key:               aws.String("eks-auto-scaled-at"),
-				Value:             &timestamp,
+				Value:             &ts,
 				PropagateAtLaunch: aws.Bool(false),
 			},
 		},

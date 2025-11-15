@@ -1,6 +1,7 @@
+// go.mod
 module eks-auto-scaler
 
-go 1.25
+go 1.20
 
 require (
     github.com/aws/aws-sdk-go-v2 v1.30.3

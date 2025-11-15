@@ -26,7 +26,7 @@ func NewNotifier(token string, chatID int64, enabled bool) (*Notifier, error) {
 
 func (n *Notifier) Send(msg string) {
 	if !n.enabled {
-		log.Printf("[Telegram Disabled] %s", msg)
+		log.Printf("[Telegram Disabled] %s", truncate(msg, 100))
 		return
 	}
 	message := tgbotapi.NewMessage(n.chatID, msg)
